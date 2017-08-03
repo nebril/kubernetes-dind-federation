@@ -79,7 +79,7 @@ services:
       --v=4
     ports: [ "8888", "6443" ]
     volumes:
-    - ${DOCKER_IN_DOCKER_WORK_DIR}/auth:/var/run/kubernetes/auth:ro
+    - dind_auth_vol:/var/run/kubernetes:ro
     links:
     - etcd
   controller:
@@ -112,3 +112,10 @@ services:
       --v=4
     links:
     - apiserver
+  dind_auth:
+    image: alpine
+    external_links:
+    - dind_auth
+volumes:
+  dind_auth_vol:
+    external: true
