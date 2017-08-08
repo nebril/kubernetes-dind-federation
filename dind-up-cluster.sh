@@ -31,6 +31,23 @@ if [ ! -f cluster/kubectl.sh ]; then
   exit 1
 fi
 
+dind::kubectl_container() {
+	if docker inspect kubectl > /dev/null; then
+		echo "kubectl container found"
+	else
+		echo "kubectl container creating"
+		docker run -d -it --name kubectl --entrypoint "/bin/sh" alpine -c "while true; do sleep 1000; done"
+        docker cp ~/.kube/config kubectl:/root/config
+	    docker exec kubectl mkdir -p ${DOCKER_IN_DOCKER_WORK_DIR}/auth
+	    docker cp ${DOCKER_IN_DOCKER_WORK_DIR}/auth kubectl:${DOCKER_IN_DOCKER_WORK_DIR}
+	    docker cp _output/bin kubectl:/usr
+    fi
+}
+
+dind::kubectl_in_container() {
+    docker exec kubectl kubectl --kubeconfig /root/config --context ${CLUSTER_NAME} $@
+}
+
 # Execute a docker-compose command with the default environment and compose file.
 function dind::docker_compose {
   local params="$@"
@@ -166,10 +183,12 @@ EOF
   mv ${auth_dir}/certs/* ${auth_dir}
   cat "${auth_dir}/apiserver.pem" "${auth_dir}/ca.pem" > "${auth_dir}/apiserver-bundle.pem"
 
-  docker volume create dind_auth_vol
-  docker create -v dind_auth_vol:/var/run/kubernetes --name dind_auth alpine /bin/true
-  docker cp ${auth_dir} dind_auth:/var/run/kubernetes
-  docker network connect ${CLUSTER_NAME}_default dind_auth
+  docker volume create --name ${CLUSTER_NAME}_auth_vol
+  docker create -v ${CLUSTER_NAME}_auth_vol:/var/run/kubernetes --name ${CLUSTER_NAME}_auth busybox /bin/true
+  docker cp ${auth_dir} ${CLUSTER_NAME}_auth:/var/run/kubernetes
+  docker network connect ${CLUSTER_NAME}_default ${CLUSTER_NAME}_auth
+
+  docker rm tls-certs
 }
 
 # Create default docker network for the cluster
@@ -199,11 +218,15 @@ function dind::kube-up {
   dind::init_auth
 
   dind::step "Starting dind cluster"
-  dind::docker_compose up -d --force-recreate --scale node=${NUM_NODES}
+  if ! dind::docker_compose up -d --force-recreate --scale node=${NUM_NODES}; then
+    echo "  ${CLUSTER_NAME}_auth_vol:" >> dind/docker-compose.yml
+    echo "    external: true" >> dind/docker-compose.yml
+    dind::docker_compose up -d --force-recreate --scale node=${NUM_NODES}
+  fi
 
   local apiserver_port=$(dind::get-apiserver-port 6443)
   dind::step -n "Waiting for https://${APISERVER_ADDRESS}:${apiserver_port} to be healthy"
-  while ! curl -o /dev/null -s --cacert ${DOCKER_IN_DOCKER_WORK_DIR}/auth/ca.pem https://${APISERVER_ADDRESS}:${apiserver_port}; do
+  while ! docker exec ${CLUSTER_NAME}_apiserver_1 curl -o /dev/null -s --cacert /var/run/kubernetes/auth/ca.pem https://${APISERVER_ADDRESS}:${apiserver_port}; do
     sleep 1
     echo -n "."
   done
@@ -212,6 +235,7 @@ function dind::kube-up {
   dind::detect-master
   dind::detect-nodes
   dind::create-kubeconfig
+  dind::kubectl_container
 
   if [ "${ENABLE_CLUSTER_DNS}" == "true" ]; then
     dind::deploy-dns
@@ -231,9 +255,11 @@ function dind::kube-up {
 
 function dind::deploy-dns {
   dind::step "Deploying kube-dns"
-  "cluster/kubectl.sh" --namespace kube-system create -f "${DIND_ROOT}/k8s/kubedns-cm.yml"
-  "cluster/kubectl.sh" --namespace kube-system create -f "cluster/addons/dns/kubedns-sa.yaml"
-  "cluster/kubectl.sh" create -f <(
+  docker cp "${DIND_ROOT}/k8s/kubedns-cm.yml" kubectl:/tmp/tmp.yml
+  dind::kubectl_in_container --namespace kube-system create -f /tmp/tmp.yml
+  docker cp "cluster/addons/dns/kubedns-sa.yaml" kubectl:/tmp/tmp.yml
+  dind::kubectl_in_container --namespace kube-system create -f /tmp/tmp.yml
+  (
     for f in kubedns-controller.yaml kubedns-svc.yaml; do
       echo "---"
       eval "cat <<EOF
@@ -241,13 +267,17 @@ $(<"cluster/addons/dns/${f}.sed")
 EOF
 " 2>/dev/null
     done
-  )
+  ) > tmp.yml
+  docker cp tmp.yml kubectl:/tmp/tmp.yml
+  dind::kubectl_in_container create -f /tmp/tmp.yml
 }
 
 function dind::deploy-ui {
   dind::step "Deploying dashboard"
-  "cluster/kubectl.sh" create -f "cluster/addons/dashboard/dashboard-controller.yaml"
-  "cluster/kubectl.sh" create -f "cluster/addons/dashboard/dashboard-service.yaml"
+  docker cp "cluster/addons/dashboard/dashboard-controller.yaml" kubectl:/tmp/tmp.yml
+  dind::kubectl_in_container create -f /tmp/tmp.yml
+  docker cp "cluster/addons/dashboard/dashboard-service.yaml" kubectl:/tmp/tmp.yml
+  dind::kubectl_in_container create -f /tmp/tmp.yml
 }
 
 function dind::deploy-federation {
@@ -259,31 +289,38 @@ function dind::deploy-federation {
   mkdir -p _output/dockerized/bin/linux/amd64
   cp -u _output/bin/hyperkube _output/dockerized/bin/linux/amd64/hyperkube || true
 
-  "cluster/kubectl.sh" create namespace "${FEDERATION_NAMESPACE}"
+  dind::kubectl_in_container create namespace "${FEDERATION_NAMESPACE}"
 
   # install etcd
-  "cluster/kubectl.sh" create -n ${FEDERATION_NAMESPACE} -f "${DIND_ROOT}/k8s/etcd.yml"
+  docker cp "${DIND_ROOT}/k8s/etcd.yml" kubectl:/tmp/tmp.yml
+  dind::kubectl_in_container create -n ${FEDERATION_NAMESPACE} -f /tmp/tmp.yml
   dind::await_ready "k8s-app=coredns-etcd" "600" ${FEDERATION_NAMESPACE}
 
   # install coredns
-  "cluster/kubectl.sh" create -n ${FEDERATION_NAMESPACE} -f "${DIND_ROOT}/k8s/coredns.yml"
+  dind::kubectl_in_container create -n ${FEDERATION_NAMESPACE} -f "${DIND_ROOT}/k8s/coredns.yml"
   dind::await_ready "k8s-app=coredns" "600" ${FEDERATION_NAMESPACE}
 
   # install private docker registry
-  "cluster/kubectl.sh" create -n ${FEDERATION_NAMESPACE} -f "${DIND_ROOT}/k8s/registry.yml"
+  docker cp "${DIND_ROOT}/k8s/registry.yml" kubectl:/tmp/tmp.yml
+  dind::kubectl_in_container create -n ${FEDERATION_NAMESPACE} -f /tmp/tmp.yml
   dind::await_ready "k8s-app=kube-registry" "${DOCKER_IN_DOCKER_ADDON_TIMEOUT}" "${FEDERATION_NAMESPACE}"
-  "cluster/kubectl.sh" create -n ${FEDERATION_NAMESPACE} -f "${DIND_ROOT}/k8s/registry-svc.yml"
-  "cluster/kubectl.sh" create -n ${FEDERATION_NAMESPACE} -f <(eval "cat <<EOF
+
+  docker cp "${DIND_ROOT}/k8s/registry-svc.yml" kubectl:/tmp/tmp.yml
+  dind::kubectl_in_container create -n ${FEDERATION_NAMESPACE} -f /tmp/tmp.yml
+
+  (eval "cat <<EOF
 $(<"${DIND_ROOT}/k8s/registry-ds.yml")
 EOF
-" 2>/dev/null)
+" 2>/dev/null) > tmp.yml
+  docker cp tmp.yml kubectl:/tmp/tmp.yml
+  dind::kubectl_in_container create -n ${FEDERATION_NAMESPACE} -f /tmp/tmp.yml
   dind::await_ready "k8s-app=registry-proxy" "${DOCKER_IN_DOCKER_ADDON_TIMEOUT}" "${FEDERATION_NAMESPACE}"
-  
+
   # local proxy to push images
-  POD=$("cluster/kubectl.sh" get pods --namespace ${FEDERATION_NAMESPACE} -l k8s-app=kube-registry \
+  POD=$(dind::kubectl_in_container get pods --namespace ${FEDERATION_NAMESPACE} -l k8s-app=kube-registry \
 	  -o template --template '{{range .items}}{{.metadata.name}} {{.status.phase}}{{"\n"}}{{end}}' \
 	  | grep Running | head -1 | cut -f1 -d' ')
-  "cluster/kubectl.sh" port-forward --namespace ${FEDERATION_NAMESPACE} $POD ${REGISTRY_LOCAL_PORT}:5000 &
+  dind::kubectl_in_container port-forward --namespace ${FEDERATION_NAMESPACE} $POD ${REGISTRY_LOCAL_PORT}:5000 &
 
   # push hyperkube image
   tag=`< /dev/urandom tr -dc A-Za-z0-9 | head -c${1:-8};echo`
@@ -307,10 +344,10 @@ EOF
 }
 
 function dind::remove-federation {
-  "cluster/kubectl.sh" delete namespace ${FEDERATION_NAMESPACE} || true
-  "cluster/kubectl.sh" delete namespace ${FEDERATION_NAMESPACE}-system || true
-  "cluster/kubectl.sh" delete clusterrole "federation-controller-manager:federation-${CLUSTER_NAME}-${CLUSTER_NAME}" || true
-  "cluster/kubectl.sh" delete clusterrolebindings "federation-controller-manager:federation-${CLUSTER_NAME}-${CLUSTER_NAME}" || true
+  dind::kubectl_in_container delete namespace ${FEDERATION_NAMESPACE} || true
+  dind::kubectl_in_container delete namespace ${FEDERATION_NAMESPACE}-system || true
+  dind::kubectl_in_container delete clusterrole "federation-controller-manager:federation-${CLUSTER_NAME}-${CLUSTER_NAME}" || true
+  dind::kubectl_in_container delete clusterrolebindings "federation-controller-manager:federation-${CLUSTER_NAME}-${CLUSTER_NAME}" || true
   pkill -f "kubectl.*${REGISTRY_LOCAL_PORT}"
 }
 
@@ -333,6 +370,10 @@ function dind::kube-down {
   dind::docker_compose rm -f
   dind::step "Removing cluster network ${CLUSTER_NAME}_default"
   dind::delete_default_network
+
+  docker rm ${CLUSTER_NAME}_auth
+  docker volume rm ${CLUSTER_NAME}_auth_vol
+  docker rm kubectl -f
 }
 
 # Waits for a kube-system pod (of the provided name) to have the phase/status "Running".
@@ -378,7 +419,7 @@ function dind::await_tpr {
 function dind::is_pod_ready {
   local label="$1"
   local namespace="$2"
-  local kubectl="cluster/kubectl.sh"
+  local kubectl=dind::kubectl_in_container
   local phase=$("${kubectl}" get pods --namespace=${namespace} -l ${label} -o jsonpath --template="{.items[0]['status']['conditions'][?(@.type==\"Ready\")].status}" 2>/dev/null)
   phase="${phase:-Unknown}"
   echo "${phase}"
@@ -403,7 +444,7 @@ if [ $(basename "$0") = dind-up-cluster.sh ]; then
     source "${DIND_ROOT}/config.sh"
     dind::kube-up
     echo
-    "cluster/kubectl.sh" cluster-info
+    dind::kubectl_in_container cluster-info
     if [ "${1:-}" = "-w" ]; then
       trap "echo; dind::kube-down" INT
       echo

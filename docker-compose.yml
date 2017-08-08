@@ -79,7 +79,7 @@ services:
       --v=4
     ports: [ "8888", "6443" ]
     volumes:
-    - dind_auth_vol:/var/run/kubernetes:ro
+    - ${CLUSTER_NAME}_auth_vol:/var/run/kubernetes:ro
     links:
     - etcd
   controller:
@@ -96,7 +96,7 @@ services:
       --root-ca-file=/var/run/kubernetes/auth/ca.pem
       --v=4
     volumes:
-    - ${DOCKER_IN_DOCKER_WORK_DIR}/auth:/var/run/kubernetes/auth:ro
+    - ${CLUSTER_NAME}_auth_vol:/var/run/kubernetes:ro
     links:
     - apiserver
   scheduler:
@@ -112,10 +112,4 @@ services:
       --v=4
     links:
     - apiserver
-  dind_auth:
-    image: alpine
-    external_links:
-    - dind_auth
 volumes:
-  dind_auth_vol:
-    external: true
